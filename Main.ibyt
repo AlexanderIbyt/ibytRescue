@@ -1,0 +1,1632 @@
+// rescue - data recovery for BareMetal (version 1).
+//
+// Purpose:    Boot from a stick, read a drive and get documents back. Two ways:
+//             1  Deleted FAT files: walk all folders and look for entries that are marked as deleted (0xE5). The content is read
+//                from the first cluster onwards as one contiguous run (on FAT32 the cluster chain is empty after deleting).
+//             2  Carving: scan the whole drive for file beginnings (JPEG, PNG, PDF, ZIP/Office); the end is searched in the content.
+// Safety:     The source drive is never written. Writing happens only through FatWrite on the target drive (must be a different one).
+// Storage:    No single variables. All numbers live in the rescuareeState container, hits in the H* arrays, switches in the Fl flags.
+// Flow:       Start -> pick source + target -> menu -> ScanDeleted or Carve (fills the hit list) -> Browse -> Recover -> Store
+
+ibyt_bare
+ibyt_regcheck
+import <BasicBare.ibyt>
+import <Keyboard.ibyt>
+import <Disk.ibyt>
+import <Fat.ibyt>
+import <FatWrite.ibyt>
+
+// Switches
+//   endDir      the folder scan reached the end marker (first byte 0) of a folder
+//   full        the hit list is full (MAXHITS), searching stops
+//   abort       the user pressed Esc in a drive question
+//   uncertain   the end of the carved file was not found, the size is a guess
+//   batch       currently unused
+private flag Fl{ endDir, full, abort, uncertain, batch }
+
+// rescueState: the numbers of one run (drives, geometry of the FAT partition, search state, recover state)
+//   source        source drive (BIOS number)
+//   target        target drive (BIOS number)
+//   sectors       sectors of the source
+//   hits          number of hits
+//   selected      selected hit
+//   top           first hit shown in the list
+//   partStart     partition: first sector
+//   fatKind       1 FAT12, 2 FAT16, 3 FAT32
+//   clusterSecs   sectors per cluster
+//   reservedSecs  reserved sectors (before the first FAT)
+//   fatCount      number of FAT copies
+//   rootSecs      sectors of the fixed root folder (FAT12/16, 0 on FAT32)
+//   fatStart      first sector of the first FAT
+//   rootStart     first sector of the fixed root folder (FAT12/16)
+//   dataStart     first sector of the data area (= cluster 2)
+//   dataSecs      sectors in the data area
+//   rootCluster   first cluster of the root folder (FAT32)
+//   queueHead     folder queue: next entry to scan
+//   queueTail     folder queue: next free entry
+//   fatCached     sector that is currently held in FatBuf
+//   dirCluster    folder scan: current cluster
+//   dirSector     folder scan: sector inside the cluster
+//   guard         protection against broken cluster chains
+//   lba           carving: first sector of the current block
+//   readErrors    read errors while searching
+//   pathLen       length of the target path in Path
+//   recSize       size of the file that is being rescued
+//   saved         files saved in this round
+//   failed        files that could not be saved in this round
+//   avail         sectors that are available for the file (carving)
+//   partNo        partition search: current number
+//   partCount     partition search: number of partitions
+private int64 rescueState{ source, target, sectors, hits, selected, top, partStart, fatKind, clusterSecs, reservedSecs, fatCount, rootSecs, fatStart, rootStart, dataStart, dataSecs, rootCluster, queueHead, queueTail, fatCached, dirCluster, dirSector, guard, lba, readErrors, pathLen, recSize, saved, failed, avail, partNo, partCount }
+
+private define MAXHITS:   256            // size of the hit list
+private define RECBUF:    0x4000000     // 64 MiB: here the file lies before it is saved
+private define RECMAX:    0x2000000     // at most 32 MiB per file
+private define CARVEWIN:  0x800000      // carving: search window 8 MiB (currently unused, Recover uses 16384 sectors directly)
+private define CHUNK:     128           // sectors per read while carving
+
+private int64 DirQ[256]                 // folder queue: start clusters of the folders still to scan
+private int64 HLba[256]                 // hit: first sector of the data
+private int64 HSize[256]                // hit: file size (known for FAT entries, 0 for carved files)
+private byte HKind[256]                 // hit: 1 JPEG, 2 PNG, 3 PDF, 4 ZIP, 5 deleted FAT entry
+private byte HName[3072]                // hit: 8.3 name as 11 bytes, 12 bytes per hit
+private byte Sec[65536]                 // read buffer: one sector for FAT work, CHUNK sectors for carving
+private byte FatBuf[1024]               // two sectors of the FAT (an entry may cross a sector border on FAT12)
+private byte Path[128]                  // target path of the file being saved, zero terminated
+
+// ───────────── small building blocks (inline) ─────────────
+// Two bytes at $pTemp + $index -> $counter (little endian). $index is 2 further afterwards.
+// $value is used as scratch.
+codeblock RdWord{
+    $counter@Low: $pTemp@Data[$index@Pos]
+    $index +: 1
+    $value@Byte: $pTemp[$index]
+    $value <<: 8
+    $counter |: $value
+    $index +: 1
+    end
+}
+
+// Four bytes at $pTemp + $index -> $counter (little endian). $index is 4 further afterwards.
+// $value is used as scratch.
+codeblock RdDword{
+    $counter@Low: $pTemp@Data[$index@Pos]
+    $index +: 1
+    $value@Byte: $pTemp[$index]
+    $value <<: 8
+    $counter |: $value
+    $index +: 1
+    $value@Byte: $pTemp[$index]
+    $value <<: 16
+    $counter |: $value
+    $index +: 1
+    $value@Byte: $pTemp[$index]
+    $value <<: 24
+    $counter |: $value
+    $index +: 1
+    end
+}
+
+// Start cluster of the folder entry at $pTemp -> $counter (high word at offset 20, low word at offset 26)
+// $index and $value are used as scratch.
+codeblock EntClus{
+    $counter@High: $pTemp@Entry[21]
+    $counter <<: 8
+    $value@Byte: $pTemp[20]
+    $counter |: $value
+    $counter <<: 16
+    $index@Low: $pTemp[27]
+    $index <<: 8
+    $value@Byte: $pTemp[26]
+    $index |: $value
+    $counter |: $index
+    end
+}
+
+// File size of the folder entry at $pTemp -> $index (offset 28..31)
+// $value is used as scratch.
+codeblock EntSize{
+    $index@Size: $pTemp@Entry[31]
+    $index <<: 8
+    $value@Byte: $pTemp[30]
+    $index |: $value
+    $index <<: 8
+    $value@Byte: $pTemp[29]
+    $index |: $value
+    $index <<: 8
+    $value@Byte: $pTemp[28]
+    $index |: $value
+    end
+}
+
+// ───────────── drives ─────────────
+// List the BIOS drives 0x80..0x87 that answer, with their size in MB.
+private methode ShowDrives(base, counter, slot, value, item, admin){
+    $slot: 0
+
+    ->Next
+        $base@Drive: $slot@Index
+        $base +: 0x80                                // BIOS number of the hard disk
+        prepare $base@Drive call Disk.Info(=)
+        goto_flag not_carry Skip                     // no such drive
+
+        prepare "  Drive " call BasicBare.Print(=)
+
+        prepare $slot call BasicBare.PrintInt(=)
+
+        prepare ":  " call BasicBare.Print(=)
+
+        $counter *: $value@Bytes                           // sectors * bytes per sector ...
+        $counter >>: 20                              // ... / 1 MiB
+        prepare $counter@MB call BasicBare.PrintInt(=)
+
+        prepare " MB\n" call BasicBare.Print(=)
+
+    ->Skip
+        $slot +: 1
+        compare ( $slot@Index < 8 ) goto_true Next↑
+}
+
+// $pBase = question. Key 0..7 chooses an existing drive -> $counter = BIOS number. Esc sets Fl.abort.
+prepare $base@Prompt
+private methode PickDrive(_, base, focus counter, value, item, admin){
+    prepare $base call BasicBare.Print(=)
+
+    ->Again
+        call Keyboard.GetKey(=)
+        compare ( $base@Key = 27 ) goto_true Quit        // Esc
+
+        $base -: 48                                  // '0' -> 0
+        compare ( $base >= 8 ) goto_true Again↑      // not a digit 0..7
+
+        $base +: 0x80
+        prepare $base call Disk.Info(=)
+        goto_flag not_carry Again↑                   // the drive does not exist: ask again
+
+        $counter: $base
+        $base -: 0x80
+        $base +: 48
+        prepare $base call BasicBare.PrintChar(=)    // echo the chosen digit
+
+        prepare "\n" call BasicBare.Print(=)
+        goto Done
+
+    ->Quit
+        Fl.abort: true
+
+    ->Done
+}
+
+// ───────────── reading the FAT ─────────────
+// FAT entry of cluster $base -> $counter = next cluster (0 = end of chain or invalid)
+// FatBuf holds two sectors, so a FAT12 entry that crosses a sector border still lies inside the buffer.
+prepare $base@Cluster
+private methode NextClus(_, base, temp, work, index, focus counter, slot, value, unit, item, admin){
+    $unit: $base                                     // remember the cluster number (odd/even matters for FAT12)
+    $slot: rescueState.fatKind
+    $work: $base
+    compare ( $slot = 3 ) goto_true K32
+
+    compare ( $slot = 2 ) goto_true K16
+
+    $work >>: 1                                  // FAT12: cluster * 3 / 2
+    $work +: $base
+    goto Off
+
+    ->K16
+        $work *: 2                               // FAT16: 2 bytes per entry
+        goto Off
+
+    ->K32
+        $work *: 4                               // FAT32: 4 bytes per entry
+
+    ->Off
+        $index: $work@Offset
+        $index &: 511                                // position inside the sector
+        $work >>: 9
+        $value: rescueState.fatStart
+        $work +: $value                              // sector of the FAT
+        $value: rescueState.fatCached
+        compare ( $value = $work ) goto_true Cached
+
+        rescueState.fatCached: $work
+        $base: $work
+        prepare $base, $pTemp@Target: FatBuf, $work: 2 call Disk.Read(=)
+        goto_flag carry Cached
+
+        $value: 0xFFFFFFFFFF                         // read error: the cache is invalid
+        rescueState.fatCached: $value@NoSector
+        $counter: 0
+        goto Done
+
+    ->Cached
+        $pTemp: FatBuf
+        compare ( $slot@Kind = 3 ) goto_true R32
+
+        inline RdWord()                              // FAT12/16: two bytes at the position
+        compare ( $slot = 2 ) goto_true E16
+
+        $value@Cluster: $unit@Cluster                                // FAT12: odd cluster = upper 12 bits
+        $value &: 1
+        compare ( $value = 0 ) goto_true Even
+
+        $counter >>: 4
+        goto E12
+
+    ->Even
+        $counter &: 0xFFF
+
+    ->E12
+        compare ( $counter@Next >= 0xFF7 ) goto_true Zero     // 0xFF7 and up: bad cluster or end of chain
+        goto Chk
+
+    ->E16
+        compare ( $counter@Next >= 0xFFF7 ) goto_true Zero
+        goto Chk
+
+    ->R32
+        inline RdDword()
+        $counter &: 0x0FFFFFFF                       // FAT32 uses only 28 bits
+        compare ( $counter@Next >= 0x0FFFFFF7 ) goto_true Zero
+
+    ->Chk
+        compare ( $counter@Next >= 2 ) goto_true Done     // clusters 0 and 1 do not exist
+
+    ->Zero
+        $counter: 0
+
+    ->Done
+}
+
+// Read one partition found by Fat.Part: geometry -> rescueState ($base = start sector, $work = kind). Carry = 1: usable.
+// All values come from the boot sector (BPB). Afterwards rescueState.dataSecs = 0 means "not usable".
+prepare $base@Start, $work@Kind
+private methode ReadGeom(base, temp, work, index, counter, value, unit, item, admin){
+    rescueState.partStart: $base
+    rescueState.fatKind: $work
+    prepare $base, $pTemp@Target: Sec, $work: 1 call Disk.Read(=)
+    goto_flag not_carry Bad
+
+    $pTemp: Sec
+    $index: 11                                      // bytes per sector
+    inline RdWord()
+    compare ( $counter@SectorSize != 512 ) goto_true Bad       // only 512-byte sectors
+
+    $index: 13                                      // sectors per cluster
+    $counter@ClusterSecs: $pTemp[$index@Offset]
+    compare ( $counter = 0 ) goto_true Bad
+
+    rescueState.clusterSecs: $counter
+    $index: 14                                      // reserved sectors
+
+    inline RdWord()
+
+    rescueState.reservedSecs: $counter
+    $index: 16                                      // number of FATs
+    $counter@FatCount: $pTemp[$index@Offset]
+    rescueState.fatCount: $counter
+    $index: 17
+
+    inline RdWord()                              // entries in the fixed root folder
+
+    $counter +: 15
+    $counter >>: 4                               // sectors = (entries * 32 + 511) / 512
+    rescueState.rootSecs: $counter
+    $index: 22                                      // sectors per FAT (FAT12/16)
+
+    inline RdWord()
+
+    $unit: $counter                              // sectors per FAT
+    compare ( $unit != 0 ) goto_true HaveFat
+
+    $index: 36                                      // FAT32: sectors per FAT are a dword at 36
+
+    inline RdDword()
+
+    $unit: $counter
+
+    ->HaveFat
+        $work: rescueState.fatCount
+        $work *: $unit@FatSecs                               // sectors of all FATs together
+        $base: rescueState.partStart
+        $value: rescueState.reservedSecs
+        $base +: $value
+        rescueState.fatStart: $base
+        $base +: $work
+        rescueState.rootStart: $base
+        $value: rescueState.rootSecs
+        $base +: $value
+        rescueState.dataStart: $base                        // first sector of cluster 2
+        $index: 19                                      // total sectors (16 bit field)
+        inline RdWord()
+        compare ( $counter@Total != 0 ) goto_true HaveTot
+
+        $index: 32                                      // total sectors (32 bit field)
+        inline RdDword()
+
+    ->HaveTot
+        $value: rescueState.partStart
+        $base -: $value                              // sectors before the data
+        compare ( $counter@Total <= $base@Before ) goto_true Bad
+
+        $counter -: $base
+        rescueState.dataSecs: $counter
+        $index: 44                                      // FAT32: first cluster of the root folder
+        inline RdDword()
+        rescueState.rootCluster: $counter
+        $base: 0xFFFFFFFFFF
+        rescueState.fatCached: $base@NoSector                 // the FAT cache is invalid for the new partition
+        goto Good
+
+    ->Bad
+        $base: 0
+        rescueState.dataSecs: $base@NoData
+
+    ->Good->
+}
+
+// One sector of a folder ($base = sector): remember deleted entries, put sub folders into the queue.
+// A folder entry is 32 bytes, 16 per sector. Offsets: 0 name (0 = end, 0xE5 = deleted), 11 attributes,
+// 20/26 start cluster, 28 size.
+prepare $base@Sector
+private methode ScanSector(base, temp, work, index, counter, slot, value, unit, item, admin){
+    prepare $base, $pTemp@Target: Sec, $work@Count: 1 call Disk.Read(=)
+    goto_flag not_carry Done
+
+    $pTemp: Sec
+    $slot: 16                                       // entries left in this sector
+
+    ->Entry
+        $value@First: $pTemp@Entry[0]
+        compare ( $value = 0 ) goto_true EndDir     // 0 = no more entries in this folder
+
+        $unit@Attr: $pTemp[11]                           // attributes
+        compare ( $unit = 15 ) goto_true NextE      // entry for a long name
+
+        compare ( $value = 0xE5 ) goto_true Deleted
+
+        $work: $unit
+        $work &: 16
+        compare ( $work = 0 ) goto_true NextE       // neither file nor folder
+
+        compare ( $value = 46 ) goto_true NextE     // . and ..
+
+        // a live folder: put its start cluster into the queue
+        inline EntClus()
+        compare ( $counter@Cluster < 2 ) goto_true NextE
+
+        $work: rescueState.queueTail
+        compare ( $work >= 256 ) goto_true NextE    // queue is full: ignore this folder
+
+        DirQ[$work]: $counter
+        $work +: 1
+        rescueState.queueTail: $work
+        goto NextE
+
+    ->Deleted
+        $work@Flags: $unit@Attr
+        $work &: 24                              // folder or volume label: do not rescue
+        compare ( $work != 0 ) goto_true NextE
+
+        inline EntClus()
+        compare ( $counter@Cluster < 2 ) goto_true NextE
+
+        $index@Size: 0                           // dead write: only so the register check sees $index set (EntSize sets it itself)
+        inline EntSize()
+        compare ( $index@Size = 0 ) goto_true NextE   // empty file: nothing to rescue
+
+        $work: $counter
+        $work -: 2
+        $value: rescueState.clusterSecs
+        $work *: $value                          // sectors from the start of the data area
+        $value: rescueState.dataSecs
+        compare ( $work >= $value ) goto_true NextE     // start cluster outside of the partition
+
+        $value: rescueState.dataStart
+        $work +: $value                          // sector of the first data
+        $counter: rescueState.hits
+        compare ( $counter < MAXHITS ) goto_true Room
+
+        Fl.full: true
+        goto EndDir
+
+    ->Room
+        HLba[$counter@Hit]: $work@Sector
+        HSize[$counter]: $index@Size
+        $value: 5
+        HKind[$counter]: $value@Kind
+        $unit: $counter
+        $unit *: 12
+        $value: 95
+        HName[$unit]: $value@Char                     // the first letter is gone: _
+        $base: 1
+
+    ->Cp
+            $unit +: 1
+            $value@Char: $pTemp@Entry[$base@Pos]
+            HName[$unit@Name]: $value
+            $base +: 1
+            compare ( $base < 11 ) goto_true Cp↑     // copy the other 10 name bytes
+
+        $counter +: 1
+        rescueState.hits: $counter@Hits
+
+    ->NextE
+        $pTemp +: 32
+        $slot -: 1
+        goto_flag not_zero Entry↑
+        goto Done
+
+    ->EndDir
+        Fl.endDir: true
+
+    ->Done
+}
+
+// One folder: $base = start cluster (0 = fixed root folder of FAT12/16)
+// Stops at the end marker of the folder (Fl.endDir) or when the hit list is full (Fl.full).
+prepare $base@Cluster
+private methode DirScan(keep base, temp, work, index, counter, slot, value, unit, item, admin){
+    Fl.endDir: false
+    compare ( $base != 0 ) goto_true Chain
+
+    // fixed root folder: consecutive sectors
+    $slot: 0
+
+    ->RLoop
+        $work: rescueState.rootSecs
+        compare ( $slot@Sector >= $work ) goto_true Done
+
+        $base: rescueState.rootStart
+        $base +: $slot
+        rescueState.dirSector: $slot
+        prepare $base call ScanSector(=)
+
+        $slot: rescueState.dirSector             // ScanSector changed $slot
+        compare ( Fl.endDir ) goto_true Done
+
+        compare ( Fl.full ) goto_true Done
+
+        $slot +: 1
+        goto RLoop↑
+
+    // folder in the data area: follow the cluster chain
+    ->Chain
+        rescueState.dirCluster: $base@Cluster
+        $value: 0
+        rescueState.guard: $value@Guard
+
+    ->CLoop
+        $base: rescueState.dirCluster
+        $base -: 2
+        $value: rescueState.clusterSecs
+        $base *: $value
+        $value: rescueState.dataStart
+        $base +: $value
+        $slot: 0
+
+    ->SLoop
+            rescueState.dirSector: $slot@Sector
+            $base: rescueState.dirCluster
+            $base -: 2
+            $value: rescueState.clusterSecs
+            $base *: $value
+            $value: rescueState.dataStart
+            $base +: $value
+            $base +: $slot                       // sector inside the cluster
+            prepare $base call ScanSector(=)
+            compare ( Fl.endDir ) goto_true Done
+
+            compare ( Fl.full ) goto_true Done
+
+            $slot: rescueState.dirSector
+            $slot +: 1
+            $value: rescueState.clusterSecs
+            compare ( $slot < $value ) goto_true SLoop↑
+
+        $base: rescueState.dirCluster
+        prepare $base call NextClus(=)
+        compare ( $counter@Next = 0 ) goto_true Done     // end of the chain
+
+        rescueState.dirCluster: $counter
+        $value: rescueState.guard
+        $value +: 1
+        rescueState.guard: $value
+        compare ( $value < 8192 ) goto_true CLoop↑  // stop after 8192 clusters: the chain is probably a loop
+
+    ->Done
+}
+
+// All folders of the mounted geometry one after the other (breadth first search).
+// The queue DirQ starts with the root folder; DirScan and ScanSector append the sub folders.
+private methode WalkDirs(base, temp, work, index, counter, slot, value, unit, item, admin){
+    $base: 0
+    rescueState.queueHead: $base@Zero
+    $work: rescueState.fatKind
+    compare ( $work != 3 ) goto_true Fixed
+
+    $base: rescueState.rootCluster               // FAT32: the root folder is a normal cluster chain
+
+    ->Fixed
+        DirQ[0]: $base@Root                           // FAT12/16: 0 = fixed root folder
+        $base: 1
+        rescueState.queueTail: $base@Count
+
+    ->Loop
+        $slot: rescueState.queueHead
+        $value: rescueState.queueTail
+        compare ( $slot >= $value ) goto_true Done   // queue is empty
+
+        $base: DirQ[$slot]
+        $slot +: 1
+        rescueState.queueHead: $slot
+        prepare $base call DirScan(=)
+        compare ( Fl.full ) goto_true Done
+        goto Loop↑
+
+    ->Done
+}
+
+// Way 1: search all partitions of the source
+private methode ScanDeleted(base, temp, work, keep index, counter, slot, value, unit, item, admin){
+    $base: 0
+    rescueState.hits: $base@Zero
+    Fl.full: false
+    $base: rescueState.source
+    prepare $base call Fat.Scan(=)               // $counter = number of partitions
+    goto_flag not_carry NoPart
+
+    compare ( $counter@Parts = 0 ) goto_true NoPart
+
+    $slot: 1                                     // partition number, counted from 1
+    $index: $counter                             // number of partitions
+
+    ->Part
+        rescueState.partNo: $slot@Part
+        rescueState.partCount: $index@Parts
+        $base: $slot
+        prepare $base call Fat.Part(=)
+        goto_flag not_carry NextP
+
+        compare ( $unit@Kind > 3 ) goto_true NextP        // NTFS and others: later
+
+        prepare $base: $counter@Start, $work@Kind: $unit call ReadGeom(=)
+
+        $value: rescueState.dataSecs
+        compare ( $value = 0 ) goto_true NextP       // not usable
+
+        call WalkDirs(=)
+
+    ->NextP
+        $slot: rescueState.partNo                    // the calls above changed the registers
+        $index: rescueState.partCount
+        compare ( Fl.full ) goto_true Done
+
+        $slot +: 1
+        compare ( $slot <= $index ) goto_true Part↑
+        goto Done
+
+    ->NoPart
+        prepare $pBase@Text: "No FAT partition found on this drive.\n" call BasicBare.Print(=)
+
+    ->Done
+}
+
+// ───────────── Way 2: carving ─────────────
+// $pTemp = start of a sector -> $value = 0 none, 1 JPEG, 2 PNG, 3 PDF, 4 ZIP
+// Magic numbers: JPEG FF D8 FF, PNG 89 50 4E 47, PDF "%PDF-", ZIP/Office "PK" 03 04.
+prepare $temp@Sector
+private methode Signature(_, temp, index, focus value){
+    $value: 0
+    $index@Byte: $pTemp[0]                            // first byte decides which kind to check
+    compare ( $index = 255 ) goto_true Jpg
+
+    compare ( $index = 137 ) goto_true Png
+
+    compare ( $index = 37 ) goto_true Pdf
+
+    compare ( $index = 80 ) goto_true Zip
+    goto Done
+
+    ->Jpg
+        $index@Byte: $pTemp@Sector[1]
+        compare ( $index != 216 ) goto_true Done
+
+        $index@Byte: $pTemp[2]
+        compare ( $index != 255 ) goto_true Done
+
+        $value: 1
+        goto Done
+
+    ->Png
+        $index@Byte: $pTemp@Sector[1]
+        compare ( $index != 80 ) goto_true Done
+
+        $index@Byte: $pTemp[2]
+        compare ( $index != 78 ) goto_true Done
+
+        $index@Byte: $pTemp[3]
+        compare ( $index != 71 ) goto_true Done
+
+        $value: 2
+        goto Done
+
+    ->Pdf
+        $index@Byte: $pTemp@Sector[1]
+        compare ( $index != 80 ) goto_true Done
+
+        $index@Byte: $pTemp[2]
+        compare ( $index != 68 ) goto_true Done
+
+        $index@Byte: $pTemp[3]
+        compare ( $index != 70 ) goto_true Done
+
+        $index@Byte: $pTemp[4]
+        compare ( $index != 45 ) goto_true Done
+
+        $value: 3
+        goto Done
+
+    ->Zip
+        $index@Byte: $pTemp@Sector[1]
+        compare ( $index != 75 ) goto_true Done
+
+        $index@Byte: $pTemp[2]
+        compare ( $index != 3 ) goto_true Done
+
+        $index@Byte: $pTemp[3]
+        compare ( $index != 4 ) goto_true Done
+
+        $value: 4
+
+    ->Done
+}
+
+// Scan the whole source drive in blocks of CHUNK sectors and note every sector that starts like a known file type.
+// Files always start on a sector border here, which is true for the usual file systems.
+private methode Carve(base, temp, work, index, counter, slot, value, item, admin){
+    $base@Zero: 0
+    rescueState.hits: $base
+    rescueState.lba: $base
+    rescueState.readErrors: $base
+    Fl.full: false
+    Fl.abort: false
+    $base: rescueState.source
+    prepare $base call Disk.SetDrive(=)
+
+    ->Chunk
+        $base: rescueState.lba
+        $value: rescueState.sectors
+        compare ( $base >= $value ) goto_true Done   // end of the drive
+
+        prepare $base, $pTemp@Target: Sec, $work@Count: CHUNK call Disk.Read(=)
+        goto_flag carry Scan
+
+        $value: rescueState.readErrors               // unreadable block: count it and go on
+        $value +: 1
+        rescueState.readErrors: $value
+        goto Next
+
+    ->Scan
+        $pTemp: Sec
+        $slot: 0
+
+    ->Sector
+        prepare $temp@Sector call Signature(=)
+        compare ( $value@Kind = 0 ) goto_true NoHit
+
+        $counter: rescueState.hits
+        compare ( $counter < MAXHITS ) goto_true Room
+
+        Fl.full: true
+        goto Done
+
+    ->Room
+        $base: rescueState.lba
+        $base +: $slot@Index
+        HLba[$counter@Hit]: $base                    // sector of this hit
+        HKind[$counter]: $value@Kind
+        $base@Zero: 0
+        HSize[$counter]: $base                   // size is unknown: FindEnd searches it later
+        $counter +: 1
+        rescueState.hits: $counter
+
+    ->NoHit
+        $pTemp +: 512
+        $slot +: 1
+        compare ( $slot@Index < CHUNK ) goto_true Sector↑
+
+    ->Next
+        $base: rescueState.lba
+        $base +: CHUNK
+        rescueState.lba: $base
+        $work: $base
+        $work &: 0x7FFF                          // show progress every 16384 sectors (8 MB)
+        compare ( $work != 0 ) goto_true Poll
+
+        prepare $pBase: "\rScanned " call BasicBare.Print(=)
+
+        $base: rescueState.lba
+        $base >>: 11                             // sectors -> MB
+        prepare $base call BasicBare.PrintInt(=)
+
+        prepare $pBase: " MB, hits " call BasicBare.Print(=)
+
+        $base: rescueState.hits
+        prepare $base call BasicBare.PrintInt(=)
+
+        prepare $pBase: "   (Esc = stop)" call BasicBare.Print(=)
+
+    ->Poll
+        call Keyboard.TryKey(=)                  // key pressed? (does not wait)
+        goto_flag not_carry Chunk↑
+
+        compare ( $base@Key != 27 ) goto_true Chunk↑ // only Esc stops the search
+
+    ->Done
+        prepare $pBase@Text: "\n" call BasicBare.Print(=)
+}
+
+// ───────────── end of a JPEG ─────────────
+// The window of $work bytes starts at RECBUF with the file beginning FF D8. Result $counter = size of the file (0 = end not found).
+// A JPEG is a chain of segments: FF marker, 2 byte length (counts itself). Photos usually carry a small thumbnail inside an
+// EXIF segment, and that thumbnail has its own FF D9. So the first FF D9 is not the end: the segments are skipped one by one
+// by their length. After the segment SOS (FF DA) the picture data follows; it runs up to the next real marker
+// (FF 00 and FF D0..D7 belong to the data). The end is the marker FF D9 on the outer level.
+prepare $work@Length
+private methode FindJpg(_, temp, work, index, focus counter, slot, value, unit){
+    $unit: $work
+    $unit -: 1                                   // a marker needs two bytes: the position must stay below this
+    $temp: RECBUF
+    $index: 2                                    // behind FF D8
+
+    ->Seg
+        compare ( $index@Pos >= $unit@Last ) goto_true None
+        $value@Byte: $pTemp@Window[$index@Pos]
+        compare ( $value != 255 ) goto_true None     // no marker here: damaged
+        $slot: $index
+        $slot +: 1
+        $counter@Marker: $pTemp[$slot]
+        compare ( $counter = 255 ) goto_true Fill
+        compare ( $counter = 217 ) goto_true Eoi
+        compare ( $counter = 0 ) goto_true None
+        compare ( $counter = 1 ) goto_true Bare
+        compare ( $counter = 216 ) goto_true Bare
+        $value: $counter
+        $value -: 208
+        compare ( $value <= 7 ) goto_true Bare       // RST0..RST7 have no length
+        $slot +: 1
+        $value@High: $pTemp[$slot]
+        $value <<: 8
+        $slot +: 1
+        $work@Low: $pTemp[$slot]
+        $value |: $work                              // length of the segment
+        compare ( $value < 2 ) goto_true None
+        $index +: 2
+        $index +: $value
+        compare ( $counter != 218 ) goto_true Seg↑   // everything but SOS: next segment
+
+    // picture data after SOS: look for the next marker that is not part of the data
+    ->Scan
+        compare ( $index@Pos >= $unit@Last ) goto_true None
+        $value@Byte: $pTemp@Window[$index@Pos]
+        compare ( $value != 255 ) goto_true Step
+        $slot: $index
+        $slot +: 1
+        $value@Next: $pTemp[$slot]
+        compare ( $value = 0 ) goto_true Skip
+        compare ( $value = 255 ) goto_true Step
+        $value -: 208
+        compare ( $value <= 7 ) goto_true Skip
+        goto Seg↑                                    // a real marker: continue with the segments
+
+    ->Skip
+        $index +: 2
+        goto Scan↑
+
+    ->Step
+        $index +: 1
+        goto Scan↑
+
+    ->Fill
+        $index +: 1
+        goto Seg↑
+
+    ->Bare
+        $index +: 2
+        goto Seg↑
+
+    ->Eoi
+        $counter@Size: $index@Pos
+        $counter +: 2                                // size = position of FF D9 + 2
+        goto Done
+
+    ->None
+        $counter: 0
+
+    ->Done
+}
+
+// ───────────── find the end of a file (carving) ─────────────
+// $base = kind (1 JPEG, 2 PNG, 3 PDF, 4 ZIP), $work = length of the window in RECBUF -> $counter = file size (0 = end not found)
+// The window is searched byte by byte from the start of RECBUF. $unit is the last start position that still leaves
+// room to read the longest end marker (24 bytes).
+//   JPEG  see FindJpg (the segments are walked, so the FF D9 of a thumbnail inside the file is not taken for the end)
+//   PNG   ends with the chunk IEND plus a 4 byte checksum
+//   PDF   ends with %%EOF and an optional line break
+//   ZIP   ends with the end-of-directory record 50 4B 05 06 plus a comment whose length is stored at offset 20
+prepare $base@Kind, $work@Length
+private methode FindEnd(_, base, temp, work, index, focus counter, slot, value, unit){
+    $slot: $base
+    $unit: $work
+    $unit -: 24
+    $temp: RECBUF
+    $counter: 0
+    compare ( $slot = 1 ) goto_true Jpg
+
+    compare ( $slot = 2 ) goto_true Png
+
+    compare ( $slot = 3 ) goto_true Pdf
+
+    ->Zip
+        $value@Byte: $pTemp@Window[0]
+        compare ( $value != 80 ) goto_true ZNext
+
+        $value@Byte: $pTemp[1]
+        compare ( $value != 75 ) goto_true ZNext
+
+        $value@Byte: $pTemp[2]
+        compare ( $value != 5 ) goto_true ZNext
+
+        $value@Byte: $pTemp[3]
+        compare ( $value != 6 ) goto_true ZNext
+
+        // sanity check: the central directory (offset + size) must lie in front of this marker. A "PK 05 06" inside the
+        // data of a file (or from a stored archive) fails this check and is skipped.
+        $base@Size: $pTemp[15]
+        $base <<: 8
+        $work@Byte: $pTemp[14]
+        $base |: $work
+        $base <<: 8
+        $work@Byte: $pTemp[13]
+        $base |: $work
+        $base <<: 8
+        $work@Byte: $pTemp[12]
+        $base |: $work                           // size of the central directory
+        $index@Offset: $pTemp[19]
+        $index <<: 8
+        $work@Byte: $pTemp[18]
+        $index |: $work
+        $index <<: 8
+        $work@Byte: $pTemp[17]
+        $index |: $work
+        $index <<: 8
+        $work@Byte: $pTemp[16]
+        $index |: $work                          // where the central directory starts
+        $base +: $index
+        compare ( $base > $counter@Pos ) goto_true ZNext
+
+        $value@Byte: $pTemp[21]
+        $value <<: 8
+        $index@Byte: $pTemp[20]
+        $value |: $index                         // length of the comment
+        $counter +: 22                           // fixed part of the record
+        $counter +: $value
+        goto Done
+
+    ->ZNext
+        $temp +: 1
+        $counter +: 1
+        compare ( $counter@Pos < $unit@Last ) goto_true Zip↑
+        goto None
+
+    ->Jpg
+        prepare $work@Length call FindJpg(=)             // walks the segments: thumbnails inside the file do not end it
+        goto Done
+
+    ->Png
+        $value@Byte: $pTemp@Window[0]
+        compare ( $value != 73 ) goto_true PNext    // IEND
+
+        $value@Byte: $pTemp[1]
+        compare ( $value != 69 ) goto_true PNext
+
+        $value@Byte: $pTemp[2]
+        compare ( $value != 78 ) goto_true PNext
+
+        $value@Byte: $pTemp[3]
+        compare ( $value != 68 ) goto_true PNext
+
+        $counter +: 8                            // IEND + 4 byte checksum
+        goto Done
+
+    ->PNext
+        $temp +: 1
+        $counter +: 1
+        compare ( $counter@Pos < $unit@Last ) goto_true Png↑
+        goto None
+
+    ->Pdf
+        $value@Byte: $pTemp@Window[0]
+        compare ( $value != 37 ) goto_true FNext    // %%EOF
+
+        $value@Byte: $pTemp[1]
+        compare ( $value != 37 ) goto_true FNext
+
+        $value@Byte: $pTemp[2]
+        compare ( $value != 69 ) goto_true FNext
+
+        $value@Byte: $pTemp[3]
+        compare ( $value != 79 ) goto_true FNext
+
+        $value@Byte: $pTemp[4]
+        compare ( $value != 70 ) goto_true FNext
+
+        $counter +: 5
+        $value@Byte: $pTemp[5]
+        compare ( $value = 13 ) goto_true Cr        // CR (and maybe LF) after %%EOF belongs to the file
+
+        compare ( $value = 10 ) goto_true Lf
+        goto Done
+
+    ->Cr
+        $counter +: 1
+        $value@Byte: $pTemp@Window[6]
+        compare ( $value != 10 ) goto_true Done
+
+    ->Lf
+        $counter +: 1
+        goto Done
+
+    ->FNext
+        $temp +: 1
+        $counter +: 1
+        compare ( $counter@Pos < $unit@Last ) goto_true Pdf↑
+
+    ->None
+        $counter: 0                              // end not found
+
+    ->Done
+}
+
+// ───────────── build the target path ─────────────
+// $pBase = text -> append to Path
+prepare $base@Text
+private methode PutStr(_, base, index, value){
+    $index: rescueState.pathLen
+
+    ->Loop->
+        $value@Char: $pBase@Text[0]
+        compare ( $value = 0 ) goto_true Done
+
+        Path[$index@Pos]: $value
+        $index +: 1
+        $base +: 1
+        goto Loop↑
+
+    ->Done
+        $value@Zero: 0
+        Path[$index@Pos]: $value                     // keep Path zero terminated
+        rescueState.pathLen: $index
+}
+
+// $base = character -> append to Path
+prepare $base@Char
+private methode PutCh(_, base, index, value){
+    $index: rescueState.pathLen
+    Path[$index]: $base
+    $index +: 1
+    $value@Zero: 0
+    Path[$index]: $value
+    rescueState.pathLen: $index
+}
+
+// $base = number 0..9999 -> append four digits to Path
+prepare $base@Number
+private methode PutNum4(_, base, work, index){
+    $index: rescueState.pathLen
+    $work: $base
+    $work /: 1000
+    $work +: 48                                  // thousands
+    Path[$index]: $work
+    
+    $index +: 1
+    $base %: 1000
+    $work: $base
+    $work /: 100
+    $work +: 48                                  // hundreds
+    Path[$index]: $work
+    
+    $index +: 1
+    $base %: 100
+    $work: $base
+    $work /: 10
+    $work +: 48                                  // tens
+    Path[$index]: $work
+    
+    $index +: 1
+    $base %: 10
+    $base +: 48                                  // ones
+    Path[$index]: $base
+    
+    $index +: 1
+    $work@Zero: 0
+    Path[$index]: $work
+    rescueState.pathLen: $index
+}
+
+// Character from the 8.3 name: only letters and digits stay, everything else becomes _  ($base = character -> $base)
+// $work is used as scratch.
+codeblock Clean{
+    $work@Char: $base@Char
+    $base: 95
+    compare($work < 48) goto_true Fin
+    compare($work <= 57) goto_true Keep
+    compare($work < 65) goto_true Fin
+    compare($work <= 90) goto_true Keep
+    compare($work < 97) goto_true Fin
+    compare($work > 122) goto_true Fin
+    
+    ->Keep
+        $base: $work@Char
+    
+    ->Fin
+    end
+}
+
+// Hit $base (number from 0) -> path in Path
+//   carved file:  /RESCUE/0007_file.jpg
+//   deleted file: /RESCUE/0007__NAME.EXT   (the lost first letter is shown as _)
+prepare $base@Hit
+private methode BuildPath(_, base, work, index, counter, slot, value, unit){
+    $slot: $base
+    $counter@Zero: 0
+    rescueState.pathLen: $counter
+    prepare $pBase: "/RESCUE/" call PutStr(=)
+
+    $base: $slot
+    $base +: 1                                   // numbering for the user starts at 1
+    prepare $base call PutNum4(=)
+
+    $value: HKind[$slot]
+    compare ( $value = 5 ) goto_true Del
+
+    // carved file: fixed name plus the extension of its kind
+    prepare $pBase: "_file." call PutStr(=)
+
+    $value: HKind[$slot]
+    compare ( $value = 1 ) goto_true Jpg
+
+    compare ( $value = 2 ) goto_true Png
+
+    compare ( $value = 3 ) goto_true Pdf
+
+    prepare $pBase: "zip" call PutStr(=)
+    goto Done
+
+    ->Jpg
+        prepare $pBase@Text: "jpg" call PutStr(=)
+        goto Done
+
+    ->Png
+        prepare $pBase@Text: "png" call PutStr(=)
+        goto Done
+
+    ->Pdf
+        prepare $pBase@Text: "pdf" call PutStr(=)
+        goto Done
+
+    // deleted FAT entry: rebuild the name from the 11 stored bytes (8 name + 3 extension)
+    ->Del
+        prepare $base@Char: 95 call PutCh(=)
+
+        $unit: $slot@Hit
+        $unit *: 12
+        $counter: 0
+
+    ->Nm
+        $base: HName[$unit@Name]
+        inline Clean()
+        compare ( $counter@Count = 0 ) goto_true First
+
+        $value: HName[$unit]
+        compare ( $value = 32 ) goto_true NmEnd     // the name part is padded with spaces
+
+    ->First
+        prepare $base@Char call PutCh(=)
+
+        $unit +: 1
+        $counter +: 1
+        compare ( $counter@Count < 8 ) goto_true Nm↑
+
+    ->NmEnd
+        $unit@Name: $slot@Hit
+        $unit *: 12
+        $unit +: 8                                  // the extension starts at byte 8
+        $value: HName[$unit]
+        compare ( $value = 32 ) goto_true Done      // without extension
+
+        prepare $base@Char: 46 call PutCh(=)
+
+        $counter: 0
+
+    ->Ex
+        $base: HName[$unit@Name]
+        compare ( $base = 32 ) goto_true Done
+
+        inline Clean()
+        prepare $base call PutCh(=)
+
+        $unit +: 1
+        $counter +: 1
+        compare ( $counter@Count < 3 ) goto_true Ex↑
+
+    ->Done
+}
+
+// ───────────── recover ─────────────
+// Write Path and the data in RECBUF (rescueState.recSize bytes) to the target drive.
+// The target is mounted again for every file; the folder /RESCUE is created if it is missing.
+private methode Store(base, temp, work, counter, value, keep unit, item, admin){
+    $base: rescueState.target
+    $work: 0
+    prepare $base, $work@Partition call Fat.Mount(=)
+    goto_flag not_carry MountFail
+
+    prepare $pBase: "/RESCUE" call FatWrite.Mkdir(=)     // an error here is fine: the folder may exist already
+
+    prepare $pBase: "\r  Writing, please wait..." call BasicBare.Print(=)   // writing big files takes a while, too
+
+    $work: rescueState.recSize
+    prepare $pBase: Path, $temp@Data: RECBUF, $work call FatWrite.Save(=)
+    goto_flag not_carry SaveFail
+
+    prepare $pBase: "\r  saved  " call BasicBare.Print(=)
+
+    prepare $pBase: Path call BasicBare.Print(=)
+
+    prepare $pBase: "  " call BasicBare.Print(=)
+
+    $base: rescueState.recSize
+    prepare $base call BasicBare.PrintInt(=)
+
+    prepare $pBase: " bytes" call BasicBare.Print(=)
+    compare ( Fl.uncertain ) goto_flag not_carry Ok
+
+    prepare $pBase: "  (end not found: may be cut or too long)" call BasicBare.Print(=)
+
+    ->Ok
+        prepare $pBase@Text: "\n" call BasicBare.Print(=)
+
+        $base: rescueState.saved
+        $base +: 1
+        rescueState.saved: $base
+        goto Done
+
+    ->MountFail
+        prepare $pBase@Text: "\r  Cannot use the target drive (no FAT partition?)\n" call BasicBare.Print(=)
+        goto Failed
+
+    ->SaveFail
+        prepare $pBase@Text: "\r  Writing failed, error " call BasicBare.Print(=)
+
+        prepare $base: $counter@Error call BasicBare.PrintInt(=)
+
+        prepare $pBase: "\n" call BasicBare.Print(=)
+
+    ->Failed
+        $base: rescueState.failed
+        $base +: 1
+        rescueState.failed: $base
+
+    ->Done
+}
+
+// Read hit rescueState.selected from the source and save it on the target.
+// FAT entry: size and start are known. Carved file: read up to the next hit (at most 8 MB), then FindEnd searches the end.
+private methode Recover(base, temp, work, index, counter, slot, value, unit, item, admin){
+    Fl.uncertain: false
+    $slot: rescueState.selected
+    $value: rescueState.source
+    $work: rescueState.target
+    compare ( $value != $work ) goto_true Differ
+
+    // safety net: the menu already forbids this
+    prepare $pBase@Text: "Source and target are the same drive: refused.\n" call BasicBare.Print(=)
+    goto Done
+
+    ->Differ
+        prepare $pBase@Text: "\r  Reading, please wait..." call BasicBare.Print(=)   // big files take a while: show that we are busy
+
+        $slot@Hit: rescueState.selected                      // the call above may have changed $slot
+        $base: rescueState.source
+        prepare $base call Disk.SetDrive(=)
+
+        $base: HLba[$slot@Hit]
+        $unit: HKind[$slot]
+        compare ( $unit = 5 ) goto_true Known
+
+        // carving: read a whole search window (not only up to the next hit: a "hit" can lie inside the file itself,
+        // for example a ZIP entry that happens to start on a sector border), but not beyond the end of the drive
+        $counter: rescueState.sectors
+        $counter -: $base                        // sectors left on the drive
+        $work@Window: if ( $counter < 16384 ) $counter else 16384
+
+    ->Win
+        rescueState.avail: $work@Window
+        prepare $base@Sector, $temp@Target: RECBUF, $work call Disk.Read(=)
+        goto_flag not_carry ReadFail
+
+        $work: rescueState.avail
+        $work <<: 9                              // sectors -> bytes
+        $slot@Hit: rescueState.selected
+        $base: HKind[$slot]
+        prepare $base, $work call FindEnd(=)
+        compare ( $counter@Size != 0 ) goto_true Sized
+
+        // end not found: take the data up to the next hit (or everything we read), but at most 1 MiB, and warn the user
+        Fl.uncertain: true
+        $slot@Hit: rescueState.selected
+        $counter: rescueState.avail
+        $work@Next: $slot
+        $work +: 1
+        $value: rescueState.hits
+        compare ( $work >= $value ) goto_true Cap
+
+        $work@Start: HLba[$work]
+        $base: HLba[$slot]
+        $work -: $base                           // sectors up to the next hit
+        compare ( $work >= $counter ) goto_true Cap
+
+        $counter: $work
+
+    ->Cap
+        $counter@Sectors <<: 9                   // sectors -> bytes
+        $counter@Size: if ( $counter > 0x100000 ) 0x100000 else $counter
+
+    ->Sized
+        rescueState.recSize: $counter@Size
+        goto Write
+
+    ->Known
+        $counter: HSize[$slot@Hit]
+        $counter@Size: if ( $counter > RECMAX ) RECMAX else $counter    // limit to 32 MiB
+        rescueState.recSize: $counter
+        $work: $counter
+        $work +: 511
+        $work >>: 9                              // bytes -> sectors (rounded up)
+        prepare $base@Sector, $temp@Target: RECBUF, $work call Disk.Read(=)
+        goto_flag not_carry ReadFail
+
+    ->Write
+        $slot: rescueState.selected                          // FindEnd changed $slot
+        $base: $slot
+        prepare $base call BuildPath(=)
+
+        call Store(=)
+        goto Done
+
+    ->ReadFail
+        prepare $pBase@Text: "\r  Read error on the source drive, skipped.\n" call BasicBare.Print(=)
+
+        $base: rescueState.failed
+        $base +: 1
+        rescueState.failed: $base
+
+    ->Done
+}
+
+// ───────────── hit list (15 lines) ─────────────
+// $base = number, $work = width -> printed with spaces in front
+prepare $base@Number, $work@Width
+private methode PadNum(base, work, index, counter, value, item){
+    $value: $base                                // the number
+    $index: $base                                // copy for counting the digits
+    $counter: 1
+
+    ->Cnt
+        compare ( $index@Rest < 10 ) goto_true Pad
+
+        $index /: 10
+        $counter +: 1
+        goto Cnt↑
+
+    ->Pad
+        $work -: $counter@Digits                        // spaces needed = width - digits
+
+    ->Sp
+        compare ( signed $work@Spaces <= 0 ) goto_true Num
+
+        prepare $base@Char: 32 call BasicBare.PrintChar(=)
+
+        $work -: 1
+        goto Sp↑
+
+    ->Num
+        prepare $base@Number: $value@Number call BasicBare.PrintInt(=)
+}
+
+// Draw the hit list: header, then 15 rows starting at rescueState.top. The selected row is marked with ">".
+private methode ShowList(base, work, index, counter, slot, value, unit, item, admin){
+    call BasicBare.Clear(=)
+
+    prepare $pBase@Text: "Hits: " call BasicBare.Print(=)
+
+    $base: rescueState.hits
+    prepare $base call BasicBare.PrintInt(=)
+
+    prepare $pBase: "  Up/Down select, Enter = recover, A = all, Esc = back\n\n" call BasicBare.Print(=)
+
+    $slot: rescueState.top
+    $unit: 15                                    // rows on the screen
+
+    ->Row
+        $value: rescueState.hits
+        compare ( $slot@Hit >= $value ) goto_true Foot  // no more hits
+
+        $value: rescueState.selected
+        compare ( $slot = $value ) goto_true Mark
+
+        prepare $pBase@Text: "   " call BasicBare.Print(=)
+        goto NoMark
+
+    ->Mark
+        prepare $pBase@Text: " > " call BasicBare.Print(=)
+
+    ->NoMark
+        $base@Number: $slot@Hit
+        $base +: 1
+        prepare $base@Number, $work@Width: 4 call PadNum(=)
+
+        $value: HKind[$slot]
+        compare ( $value = 1 ) goto_true KJ
+
+        compare ( $value = 2 ) goto_true KP
+
+        compare ( $value = 3 ) goto_true KD
+
+        compare ( $value = 4 ) goto_true KZ
+
+        // deleted FAT entry: name and size
+        prepare $pBase: "  deleted " call BasicBare.Print(=)
+
+        $index: $slot
+        $index *: 12
+        prepare $pBase: HName[$index] call BasicBare.Print(=)
+
+        prepare $pBase: "  " call BasicBare.Print(=)
+
+        $base: HSize[$slot]
+        prepare $base call BasicBare.PrintInt(=)
+
+        prepare $pBase: " bytes\n" call BasicBare.Print(=)
+        goto NextR
+
+    ->KJ
+        prepare $pBase@Text: "  JPEG image  " call BasicBare.Print(=)
+        goto Lba
+
+    ->KP
+        prepare $pBase@Text: "  PNG image   " call BasicBare.Print(=)
+        goto Lba
+
+    ->KD
+        prepare $pBase@Text: "  PDF         " call BasicBare.Print(=)
+        goto Lba
+
+    ->KZ
+        prepare $pBase@Text: "  ZIP/Office  " call BasicBare.Print(=)
+
+    // carved file: show where it starts
+    ->Lba
+        prepare $pBase@Text: "sector " call BasicBare.Print(=)
+
+        $base: HLba[$slot@Hit]
+        prepare $base call BasicBare.PrintInt(=)
+
+        prepare $pBase: "\n" call BasicBare.Print(=)
+
+    ->NextR
+        $slot +: 1
+        $unit -: 1
+        goto_flag not_zero Row↑
+
+    ->Foot
+}
+
+// The hit list dialog. Keys: Up/Down (256/257), PgUp/PgDn (262/263), Enter (10) recover one, A recover all, Esc leave.
+// $work = selected hit, $unit = number of the last hit.
+private methode Browse(base, temp, work, index, counter, slot, value, unit, item, admin){
+    $base@Zero: 0
+    rescueState.selected: $base
+    rescueState.top: $base
+
+    ->Draw->
+        call ShowList(=)
+
+        call Keyboard.GetKey(=)
+
+        $work: rescueState.selected
+        $unit: rescueState.hits
+        $unit -: 1                               // last hit
+        compare ( $base@Key = 27 ) goto_true Done
+
+        compare ( $base = 256 ) goto_true Up
+
+        compare ( $base = 257 ) goto_true Down
+
+        compare ( $base = 262 ) goto_true PgUp
+
+        compare ( $base = 263 ) goto_true PgDn
+
+        compare ( $base = 10 ) goto_true Rec
+
+        compare ( $base = 97 ) goto_true All
+
+        compare ( $base = 65 ) goto_true All
+        goto Draw↑
+
+    ->Up
+        $work -: 1
+        $work@Selected: if ( signed $work@Selected < 0 ) 0 else $work
+        goto Fix
+
+    ->Down
+        $work +: 1
+        $work@Selected: if ( signed $work@Selected > $unit@Last ) $unit else $work
+        goto Fix
+
+    ->PgUp
+        $work -: 15
+        $work@Selected: if ( signed $work@Selected < 0 ) 0 else $work
+        goto Fix
+
+    ->PgDn
+        $work +: 15
+        $work@Selected: if ( signed $work@Selected > $unit@Last ) $unit else $work
+
+    // keep the selected row inside the window of 15 rows that starts at "top"
+    ->Fix
+        rescueState.selected: $work@Selected
+        $value: rescueState.top
+        $value@Top: if ( signed $work < $value ) $work else $value       // selection above the window: scroll up
+        $index: $work
+        $index -: 14
+        $index@MinTop: if ( signed $index < 0 ) 0 else $index
+        $value@Top: if ( signed $value < $index ) $index else $value     // selection below the window: scroll down
+        rescueState.top: $value
+        goto Draw↑
+
+    // recover the selected hit
+    ->Rec
+        call BasicBare.Clear(=)
+
+        $base@Zero: 0
+        rescueState.saved: $base
+        rescueState.failed: $base
+        call Recover(=)
+        goto Wait
+
+    // recover all hits one after the other
+    ->All
+        call BasicBare.Clear(=)
+
+        $base@Zero: 0
+        rescueState.saved: $base
+        rescueState.failed: $base
+        rescueState.selected: $base
+
+    ->Each
+            call Recover(=)
+
+            $base: rescueState.selected
+            $base +: 1
+            rescueState.selected: $base
+            $value: rescueState.hits
+            compare ( $base < $value ) goto_true Each↑
+
+        $base@Zero: 0
+        rescueState.selected: $base
+        rescueState.top: $base
+
+    ->Wait
+        prepare $pBase@Text: "\nSaved: " call BasicBare.Print(=)
+
+        $base: rescueState.saved
+        prepare $base call BasicBare.PrintInt(=)
+
+        prepare $pBase: "   failed: " call BasicBare.Print(=)
+
+        $base: rescueState.failed
+        prepare $base call BasicBare.PrintInt(=)
+
+        prepare $pBase: "   - press a key\n" call BasicBare.Print(=)
+
+        call Keyboard.GetKey(=)
+        goto Draw↑
+
+    ->Done
+}
+
+// ───────────── main program ─────────────
+Start{
+    call Keyboard.Init(=)
+
+    prepare $base@Layout: 1 call Keyboard.SetLayout(=)
+
+    // step 1: choose the drives
+    ->Pick
+        call BasicBare.Clear(=)
+
+        prepare "ibyt Rescue 1.0 - get deleted documents back (the source drive is never written)\n\n" 
+        call BasicBare.Print(=)
+
+        call ShowDrives(=)
+
+        Fl.abort: false
+        prepare "\nSOURCE drive number (the lost files are here)? " call PickDrive(=)
+        compare ( Fl.abort ) goto_true Quit
+
+        rescueState.source: $counter@Drive
+        prepare $base: $counter call Disk.Info(=)    // size of the source in sectors
+
+        rescueState.sectors: $counter
+        prepare "TARGET drive number (recovered files are written here)? " call PickDrive(=)
+        compare ( Fl.abort ) goto_true Quit
+
+        rescueState.target: $counter
+        $base: rescueState.source
+        compare ( $base != $counter ) goto_true Menu
+
+        prepare "\nSource and target must be different drives. Press a key.\n" call BasicBare.Print(=)
+
+        call Keyboard.GetKey(=)
+        goto Pick↑
+
+    // step 2: choose the way
+    ->Menu
+        call BasicBare.Clear(=)
+
+        prepare "What do you want to do?\n\n   1  Deleted files on a FAT drive (names are kept, first letter is lost)\n   2  Search the whole drive for photos, PDF and Office files (no names)\n   Esc  choose other drives\n\n" call BasicBare.Print(=)
+
+        call Keyboard.GetKey(=)
+        compare ( $base = 27 ) goto_true Pick↑
+
+        compare ( $base = 49 ) goto_true Del
+
+        compare ( $base = 50 ) goto_true Car
+        goto Menu↑
+
+    // step 3: search, this fills the hit list
+    ->Del
+        prepare "Searching all folders...\n" call BasicBare.Print(=)
+
+        call ScanDeleted(=)
+        goto Found
+
+    ->Car
+        prepare "Searching the drive...\n" call BasicBare.Print(=)
+
+        call Carve(=)
+
+    // step 4: show the hits, or say that there are none
+    ->Found
+        $base: rescueState.hits
+        compare ( $base != 0 ) goto_true Some
+
+        prepare "\nNothing found. Press a key.\n" call BasicBare.Print(=)
+
+        call Keyboard.GetKey(=)
+        goto Menu↑
+
+    ->Some
+        call Browse(=)
+        goto Menu↑
+
+    ->Quit
+        call BasicBare.Clear(=)
+
+        prepare "Rescue finished. You can switch the computer off.\n" call BasicBare.Print(=)
+
+        exit
+}
